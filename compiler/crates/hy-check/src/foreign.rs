@@ -67,9 +67,23 @@ pub(crate) const SCALAR_ATOMICS: &[&str] = &[
     "atomic.uintptr",
 ];
 
-/// Is `name` a scalar atomic (class 2)?
+/// Is `name` a scalar atomic (class 2, under M4 snake_case or Go spelling)?
 pub(crate) fn is_scalar_atomic(name: &str) -> bool {
-    SCALAR_ATOMICS.contains(&name)
+    matches!(
+        name,
+        "atomic.bool"
+            | "atomic.Bool"
+            | "atomic.int32"
+            | "atomic.Int32"
+            | "atomic.int64"
+            | "atomic.Int64"
+            | "atomic.uint32"
+            | "atomic.Uint32"
+            | "atomic.uint64"
+            | "atomic.Uint64"
+            | "atomic.uintptr"
+            | "atomic.Uintptr"
+    )
 }
 
 /// Is `name` a `sync/atomic` type OUTSIDE the scalar set — `atomic.pointer[T]`,
