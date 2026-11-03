@@ -453,6 +453,21 @@ pub(crate) fn base_ty_name(t: &TypeExpr) -> Option<String> {
             "sync.Mutex" => "sync.mutex".into(),
             "sync.RWMutex" => "sync.rwmutex".into(),
             "sync.Once" => "sync.once".into(),
+            "atomic.Bool" => "atomic.bool".into(),
+            "atomic.Int32" => "atomic.int32".into(),
+            "atomic.Int64" => "atomic.int64".into(),
+            "atomic.Uint32" => "atomic.uint32".into(),
+            "atomic.Uint64" => "atomic.uint64".into(),
+            "atomic.Uintptr" => "atomic.uintptr".into(),
+            "http.Request" => "http.request".into(),
+            "http.ResponseWriter" => "http.response_writer".into(),
+            "http.Header" => "http.header".into(),
+            "http.Handler" => "http.handler".into(),
+            "http.ServeMux" => "http.serve_mux".into(),
+            "url.URL" | "url.Url" => "url.url".into(),
+            "url.Values" => "url.values".into(),
+            "time.Duration" => "time.duration".into(),
+            "time.Time" => "time.time".into(),
             _ => name.clone(),
         }),
         TypeExpr::Pointer { to, .. } => base_ty_name(to),
@@ -1753,15 +1768,14 @@ impl Emitter {
     /// The conversion-target key of a result type (`http.handler`), if the
     /// type IS one — `return fn(…)` wrapping (Batch E).
     fn result_conv_key(&self, t: &TypeExpr) -> Option<&'static str> {
-        let name = match t {
-            TypeExpr::Named { name, .. } => name.as_str(),
-            _ => return None,
+        let Some(base) = base_ty_name(t) else {
+            return None;
         };
-        if lookup_conversion(name).is_some() {
+        if lookup_conversion(base.as_str()).is_some() {
             // Promote to 'static via the CONVERSIONS table's own key.
             shapes::CONVERSIONS
                 .iter()
-                .find(|(k, _)| *k == name)
+                .find(|(k, _)| *k == base.as_str())
                 .map(|(k, _)| *k)
         } else {
             None
