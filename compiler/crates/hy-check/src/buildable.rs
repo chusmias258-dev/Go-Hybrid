@@ -558,6 +558,8 @@ struct Collector<'a> {
     /// instantiations) — Go compiles them; bare `k` must NOT hit the
     /// value-position undeclared-type net. Swapped per body like `fn_results`.
     fn_type_params: HashSet<String>,
+    /// Whether the enclosing method receiver binds `fmt` as a generic type argument (`box[fmt]`).
+    fn_recv_captures_fmt: bool,
     /// Whether every result of the enclosing signature is named, so Go's
     /// naked `return` is legal (corpus 63).
     fn_results_all_named: bool,
@@ -584,8 +586,10 @@ struct Collector<'a> {
     /// Lexical nesting depth within `select` statements.
     select_depth: usize,
     /// Lexical nesting depth within `managed` blocks (O6.1 hatch): while
-    /// inside one, the #1112 chan-send element check is suppressed — the
-    /// `managed` hatch deliberately relaxes sendability there.
+    /// inside one, the sendability checks (#1112 `check_send_elem` and the
+    /// #2817 `check_send_assignability`) are suppressed — the `managed` hatch
+    /// deliberately relaxes sendability there and leaves the HYB-E8001 audit
+    /// as the record (`fc_closure_boundary_send_inside_managed_escapes`).
     managed_depth: usize,
     defines: Vec<Define>,
     /// Every identifier mentioned in the file plus every dotted type root —
@@ -617,6 +621,7 @@ pub(crate) fn check_buildable(ck: &mut Checker<'_>) {
             file_untyped_consts: HashSet::new(),
             fn_results: Vec::new(),
             fn_type_params: HashSet::new(),
+            fn_recv_captures_fmt: false,
             fn_results_all_named: false,
             fn_results_error_tail: false,
             scalar_scopes: Vec::new(),
@@ -763,6 +768,26 @@ impl<'a> Collector<'a> {
             }
             _ => None,
         }
+    }
+
+    /// #2817 — the exact numeric element type of a channel expression, when
+    /// the channel is a plain identifier whose declared element type is a
+    /// predeclared numeric type. `var ch chan int64` renders its declared type
+    /// into `type_name_scopes` as `chan int64`; direction qualifiers
+    /// (`<-chan int`, `chan<- int`) normalize to the element. Named types,
+    /// non-numeric elements, and unresolved bindings return `None` so the
+    /// caller stays fail-open.
+    fn chan_element_scalar(&self, e: &Expr) -> Option<&'static str> {
+        let Expr::Ident { name, .. } = unwrap_parens(e) else {
+            return None;
+        };
+        let tname = self.lookup_type_name(name)?;
+        let t = tname.trim();
+        let t = t.strip_prefix("<-").unwrap_or(t).trim();
+        let t = t.strip_prefix("chan")?;
+        let t = t.trim_start();
+        let t = t.strip_prefix("<-").unwrap_or(t).trim();
+        canonical_numeric_name(t)
     }
 
     /// A name that shadows checked defines but is not itself checked.
@@ -1595,10 +1620,22 @@ impl<'a> Collector<'a> {
         let outer = std::mem::replace(&mut self.fn_results, result_kinds);
         let outer_named = std::mem::replace(&mut self.fn_results_all_named, all_named);
         let outer_err = std::mem::replace(&mut self.fn_results_error_tail, error_tail);
+        let recv_captures_fmt = f.receiver.as_ref().is_some_and(|r| {
+            if let TypeExpr::Named { name, .. } = &r.ty {
+                if let Some(open) = name.find('[') {
+                    if name.ends_with(']') {
+                        return split_top_level_type_args(&name[open + 1..name.len() - 1])
+                            .contains(&"fmt");
+                    }
+                }
+            }
+            false
+        });
         let outer_tp = std::mem::replace(
             &mut self.fn_type_params,
             f.type_params.iter().map(|p| p.name.clone()).collect(),
         );
+        let outer_recv_fmt = std::mem::replace(&mut self.fn_recv_captures_fmt, recv_captures_fmt);
         let outer_loop = std::mem::replace(&mut self.loop_depth, 0);
         let outer_select = std::mem::replace(&mut self.select_depth, 0);
         self.block_stmts(body);
@@ -1609,6 +1646,7 @@ impl<'a> Collector<'a> {
         self.fn_results_error_tail = outer_err;
         self.fn_result_scalars = outer_scalars;
         self.fn_type_params = outer_tp;
+        self.fn_recv_captures_fmt = outer_recv_fmt;
         self.pop_scope();
     }
 
@@ -1946,6 +1984,9 @@ impl<'a> Collector<'a> {
                 self.check_single_value_position(value, "a channel send", false);
                 self.expr(value);
                 self.check_send_elem(chan, value);
+                // #2817: the sent value must be assignable to the channel's
+                // element type; Go refuses `ch <- f` for mismatched widths.
+                self.check_send_assignability(chan, value);
             }
             Stmt::If {
                 init,
@@ -2203,6 +2244,8 @@ impl<'a> Collector<'a> {
                             self.expr(chan);
                             self.expr(value);
                             self.check_send_elem(chan, value);
+                            // #2817: same assignability rule inside `select`.
+                            self.check_send_assignability(chan, value);
                         }
                         SelectArmKind::Recv { names, chan } => {
                             self.check_repeated_bindings(names, chan.span());
@@ -2439,7 +2482,10 @@ impl<'a> Collector<'a> {
                 self.check_type_name_in_value_position(name, *span);
             }
             Expr::Lit { .. } => {}
-            Expr::Interp { parts, .. } => {
+            Expr::Interp { parts, span } => {
+                if parts.iter().any(|p| matches!(p, InterpPart::Expr(_))) {
+                    self.check_interp_fmt_unshadowed(*span);
+                }
                 for p in parts {
                     if let InterpPart::Expr(x) = p {
                         self.expr(x);
@@ -3506,8 +3552,10 @@ impl<'a> Collector<'a> {
                         return Some(vec![first]);
                     }
                     "make" => return Some(vec![self.make_kind(args)]),
-                    "new" => return Some(vec![OpKind::Pointer(Box::new(OpKind::Unknown))]),
-                    "delete" | "close" | "clear" | "panic" => return Some(Vec::new()),
+                    "new" => return Some(vec![self.new_kind(args)]),
+                    "delete" | "close" | "print" | "println" | "panic" | "clear" => {
+                        return Some(Vec::new());
+                    }
                     "recover" => return Some(vec![OpKind::Interface]),
                     "min" | "max" => {
                         let res_kind = args
@@ -3600,6 +3648,85 @@ impl<'a> Collector<'a> {
             Expr::Ident { name, .. } => self.kind_of_named(name, 0),
             _ => OpKind::Unknown,
         }
+    }
+
+    fn new_kind(&self, args: &[CallArg]) -> OpKind {
+        let Some(first) = args.first() else {
+            return OpKind::Pointer(Box::new(OpKind::Unknown));
+        };
+        let bare = unwrap_parens(&first.value);
+        let inner = match bare {
+            Expr::Ident { name, .. } => {
+                if self.lookup_kind(name).is_some() || self.file_consts.contains_key(name) {
+                    OpKind::Unknown
+                } else {
+                    let k = self.kind_of_named(name, 0);
+                    if k != OpKind::Unknown {
+                        k
+                    } else {
+                        let head = Checker::base_named_type_str(name);
+                        if self.ck.structs.contains_key(name.as_str())
+                            || self.ck.structs.contains_key(head)
+                        {
+                            OpKind::Struct(Some(head.to_string()))
+                        } else {
+                            OpKind::Unknown
+                        }
+                    }
+                }
+            }
+            Expr::SliceLit {
+                elem: Some(t),
+                items,
+                ..
+            } if items.is_empty() => OpKind::Slice(Box::new(self.kind_of_ty(t, 0))),
+            Expr::MapLit {
+                key,
+                value,
+                entries,
+                ..
+            } if entries.is_empty() => OpKind::Map(
+                Box::new(self.kind_of_ty(key, 0)),
+                Box::new(self.kind_of_ty(value, 0)),
+            ),
+            Expr::StructLit {
+                ty: Some(t),
+                fields,
+                ..
+            } if fields.is_empty() => self.kind_of_ty(t, 0),
+            _ => OpKind::Unknown,
+        };
+        OpKind::Pointer(Box::new(inner))
+    }
+
+    /// #3568 — an interpolation with an expression part lowers to
+    /// `fmt.Sprintf(...)` (with `import "fmt"`). If `fmt` is bound in an
+    /// enclosing lexical/generic scope or declared at package scope, Go
+    /// captures or collides with `fmt` (`fmt.Sprintf undefined` or `fmt
+    /// redeclared in this block`).
+    fn check_interp_fmt_unshadowed(&mut self, span: Span) {
+        let local_or_tp = self
+            .scopes
+            .iter()
+            .rev()
+            .any(|layer| layer.contains_key("fmt"))
+            || self.fn_type_params.contains("fmt")
+            || self.fn_recv_captures_fmt;
+        let pkg_decl = self.ck.pkg_names.contains_key("fmt")
+            || self.ck.fns.contains_key("fmt")
+            || self.ck.structs.contains_key("fmt")
+            || self.ck.struct_type_params.contains_key("fmt")
+            || self.ck.enums.contains_key("fmt")
+            || self.ck.consts.contains_key("fmt")
+            || self.ck.type_aliases.contains_key("fmt");
+        if !local_or_tp && !pkg_decl {
+            return;
+        }
+        self.emit_e1002(
+            span,
+            "string interpolation requires package `fmt`, which is shadowed by an in-scope `fmt` declaration — Go refuses `fmt.Sprintf` (HYB-E1002)".to_string(),
+            "rename the `fmt` binding or declaration so emitter-generated `fmt.Sprintf(...)` resolves to Go's `fmt` package",
+        );
     }
 
     fn emit_e1002(&mut self, span: Span, msg: String, note: &str) {
@@ -4932,6 +5059,67 @@ impl<'a> Collector<'a> {
                 );
             }
         }
+    }
+
+    /// #2817 — Go §Send statements: "the type of the value to be sent must be
+    /// assignable to the channel's element type". `sendability.rs` treats every
+    /// numeric kind as one coarse `Primitive`, and `Stmt::Send` only ran the
+    /// #887 single-value check, so `ch <- f` with `f float64` on a `chan int`
+    /// (or `int32` → `chan int64`, `float64` → `chan float32`) passed
+    /// `hy-check` and failed `go build` with
+    /// `cannot use f (variable of type float64) as int value in send` —
+    /// a Row 13 BUILDABLE violation.
+    ///
+    /// Fail-open like the #682 U5 / #1031 precedents: only a PROVEN conflict is
+    /// reported. Untyped constants stay legal (`ch <- 1` into `chan float64`
+    /// builds), an unresolved channel element type or value type carries no
+    /// claim, and `OpKind` width collapse is compensated by comparing the
+    /// exact predeclared spellings whenever both sides are provably typed.
+    fn check_send_assignability(&mut self, chan: &Expr, value: &Expr) {
+        // O6.1: inside a `managed` block the hatch suppresses sendability
+        // checking by contract — E8001 is the auditable record instead. The
+        // #2817 rule must not reopen what the hatch closed (a top-level send
+        // of a mismatched type still fires; only the hatch is respected).
+        if self.managed_depth > 0 {
+            return;
+        }
+        let want = match self.kind_of_expr(chan) {
+            OpKind::Chan(e) => *e,
+            _ => return,
+        };
+        let got = self.kind_of_expr(value);
+        if want.is_numeric() && got.is_numeric() {
+            if let (Some(w), Some(g)) =
+                (self.chan_element_scalar(chan), self.typed_value_scalar(value))
+            {
+                if w != g {
+                    self.emit_send_mismatch(value, g, w);
+                }
+                return;
+            }
+        }
+        // A typed int value reaches a float channel through the (Float, Int)
+        // arm of `kinds_conflict`, which must stay open for untyped int
+        // constants; the same #682 U5 disambiguation applies here.
+        let typed_int_to_float = want == OpKind::Float
+            && got == OpKind::Int
+            && !self.is_untyped_int_const(value);
+        if kinds_conflict(&want, &got) || typed_int_to_float {
+            self.emit_send_mismatch(value, &got.label(), &want.label());
+        }
+    }
+
+    fn emit_send_mismatch(&mut self, value: &Expr, got: &str, want: &str) {
+        self.emit_e1002(
+            value.span(),
+            format!(
+                "cannot use `{}` (variable of type `{}`) as `{}` value in send (HYB-E1002)",
+                value.render(),
+                got,
+                want
+            ),
+            "the sent value's type must be assignable to the channel's element type (Go §Send statements)",
+        );
     }
 
     /// #682 U4 — `defer` requires a call, and that call's arguments must
@@ -7498,6 +7686,14 @@ impl<'a> Collector<'a> {
                     );
                 }
             }
+
+            "new" => {
+                if args.len() != 1 {
+                    return; // arity handled by builtins.rs
+                }
+                let op = &args[0].value;
+                self.check_new_type_operand(op, span);
+            }
             "min" | "max" => {
                 let mut first_arg: Option<(&Expr, OpKind)> = None;
                 let mut first_typed_scalar: Option<(&Expr, &'static str)> = None;
@@ -7565,7 +7761,91 @@ impl<'a> Collector<'a> {
                     }
                 }
             }
+
             _ => {}
+        }
+    }
+
+    fn check_new_type_operand(&mut self, op: &Expr, span: Span) {
+        let bare = unwrap_parens(op);
+        if matches!(bare, Expr::Lit { .. })
+            || matches!(
+                bare,
+                Expr::Unary {
+                    op: UnOp::Neg,
+                    operand,
+                    ..
+                } if matches!(unwrap_parens(operand), Expr::Lit { .. })
+            )
+        {
+            return; // already handled by builtins.rs
+        }
+        match bare {
+            Expr::Ident { name, .. } => {
+                if let Some(k) = self.lookup_kind(name) {
+                    self.emit_e2005(
+                        span,
+                        format!(
+                            "cannot use `{name}` (variable of type `{}`) as type in argument to `new` (HYB-E2005)",
+                            k.label()
+                        ),
+                        "`new` takes a type name — not a variable",
+                    );
+                } else if self.file_consts.contains_key(name) {
+                    self.emit_e2005(
+                        span,
+                        format!("cannot use `{name}` (constant) as type in argument to `new` (HYB-E2005)"),
+                        "`new` takes a type name — not a constant",
+                    );
+                } else if self.ck.fns.contains_key(name) {
+                    self.emit_e2005(
+                        span,
+                        format!("cannot use `{name}` (function) as type in argument to `new` (HYB-E2005)"),
+                        "`new` takes a type name — not a function",
+                    );
+                } else if name == "true" || name == "false" || name == "nil" {
+                    self.emit_e2005(
+                        span,
+                        format!("cannot use `{name}` as type in argument to `new` (HYB-E2005)"),
+                        "`new` takes a type name — not a literal",
+                    );
+                }
+            }
+            Expr::SliceLit {
+                elem: Some(_),
+                items,
+                ..
+            } if items.is_empty() => {}
+            Expr::MapLit { entries, .. } if entries.is_empty() => {}
+            Expr::StructLit {
+                ty: Some(TypeExpr::Chan { .. }),
+                fields,
+                ..
+            } if fields.is_empty() => {}
+            Expr::Field { base, .. } => {
+                if let Expr::Ident { name: bname, .. } = unwrap_parens(base) {
+                    if self.lookup_kind(bname).is_some() {
+                        self.emit_e2005(
+                            span,
+                            format!("cannot use `{}` as type in argument to `new` (HYB-E2005)", op.render()),
+                            "`new` takes a type — not a field access on a variable",
+                        );
+                    }
+                } else {
+                    self.emit_e2005(
+                        span,
+                        format!("cannot use `{}` as type in argument to `new` (HYB-E2005)", op.render()),
+                        "`new` takes a type name — not an expression",
+                    );
+                }
+            }
+            _ => {
+                self.emit_e2005(
+                    span,
+                    format!("argument to `new` must be a type, found expression `{}` (HYB-E2005)", op.render()),
+                    "`new` takes a type name — not a value or expression",
+                );
+            }
         }
     }
 
